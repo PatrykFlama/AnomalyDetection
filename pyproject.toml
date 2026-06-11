@@ -1,0 +1,27 @@
+[project]
+name = "anomaly-detection"
+version = "0.1.0"
+description = "Comparison of raw-data and representation-based time-series anomaly detection"
+readme = "README.md"
+requires-python = ">=3.12"
+dependencies = [
+    "kagglehub>=0.3.13",
+    "matplotlib>=3.10.9",
+    "numpy>=2.4.6",
+    "pandas>=3.0.3",
+    "scikit-learn>=1.9.0",
+    "torch>=2.12.0",
+]
+
+[dependency-groups]
+dev = [
+    "ruff>=0.15.16",
+]
+
+[tool.ruff]
+exclude = ["src/anomaly_detection/vendor"]
+line-length = 100
+target-version = "py312"
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "UP", "B"]
