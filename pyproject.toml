@@ -8,9 +8,11 @@ dependencies = [
     "kagglehub>=0.3.13",
     "matplotlib>=3.10.9",
     "numpy>=2.4.6",
+    "optuna>=4.9.0",
     "pandas>=3.0.3",
     "scikit-learn>=1.9.0",
     "torch>=2.12.0",
+    "wandb>=0.27.2",
 ]
 
 [dependency-groups]
