@@ -2,10 +2,10 @@
 """Train TS2Vec representations on the NAB time-series dataset.
 
 Changes vs the original script:
-- safer default training prefix: 15% instead of the full series;
+- validated training prefix instead of silently training on the full series;
 - normalization statistics are explicitly stored per series and should be reused at eval time;
 - metadata includes enough information to build a normal-prefix reference set downstream;
-- optional warning when training on the full series, because this can expose TS2Vec to anomalies.
+- conservative CUDA memory preflight for long TS2Vec contrastive sequences.
 """
 
 from __future__ import annotations
@@ -26,17 +26,18 @@ if str(SRC_DIR) not in sys.path:
     sys.path.insert(0, str(SRC_DIR))
 
 from anomaly_detection.data import DATASET_DIR, load_dataset  # noqa: E402
+from anomaly_detection.labels import (  # noqa: E402
+    find_labels_file,
+    labels_for_series,
+    load_label_windows,
+)
+from anomaly_detection.protocol import select_training_window  # noqa: E402
+from anomaly_detection.ts2vec_support import import_ts2vec, resolve_torch_device  # noqa: E402
 
 DEFAULT_OUTPUT_ROOT = PROJECT_ROOT / "training" / "ts2vec"
-DEFAULT_TRAIN_FRACTION = 0.15
+DEFAULT_FALLBACK_TRAIN_FRACTION = 0.05
 DEFAULT_MAX_TRAIN_LENGTH = 512
 OOM_HINT_THRESHOLD_BYTES = 4 * 1024**3
-DEFAULT_TS2VEC_PATHS = (
-    PROJECT_ROOT / "src" / "anomaly_detection" / "vendor" / "ts2vec",
-    PROJECT_ROOT / "vendor" / "ts2vec",
-    PROJECT_ROOT / "ts2vec",
-    PROJECT_ROOT.parent / "ts2vec",
-)
 
 
 def parse_args() -> argparse.Namespace:
@@ -67,14 +68,31 @@ def parse_args() -> argparse.Namespace:
         help="Optionally train on only the first N loaded series for smoke tests.",
     )
     parser.add_argument(
-        "--train-fraction",
+        "--fallback-train-fraction",
         type=float,
-        default=DEFAULT_TRAIN_FRACTION,
+        default=DEFAULT_FALLBACK_TRAIN_FRACTION,
         help=(
-            "Prefix fraction of each series used for unsupervised training and for "
-            "normalization statistics. Defaults to 0.15 to avoid fitting on the full "
-            "anomalous series. Use 1.0 only intentionally."
+            "Fallback prefix fraction used only for fixed_prefix mode or series without "
+            "labelled anomaly windows."
         ),
+    )
+    parser.add_argument("--labels-file", type=Path, default=None)
+    parser.add_argument("--no-download-labels", action="store_true")
+    parser.add_argument("--missing-labels-as-normal", action="store_true")
+    parser.add_argument(
+        "--train-mode",
+        choices=("fixed_prefix", "before_first_anomaly"),
+        default="before_first_anomaly",
+        help=(
+            "Training protocol. before_first_anomaly uses the longest labelled-clean prefix "
+            "and is the default benchmark split. fixed_prefix uses --fallback-train-fraction."
+        ),
+    )
+    parser.add_argument("--min-train-points", type=int, default=32)
+    parser.add_argument(
+        "--allow-contaminated-train",
+        action="store_true",
+        help="Allow labelled anomalies in the training window. Intended only for ablations.",
     )
     parser.add_argument(
         "--normalization",
@@ -138,47 +156,17 @@ def parse_args() -> argparse.Namespace:
     return parser.parse_args()
 
 
-def import_ts2vec(ts2vec_dir: Path | None) -> tuple[type, Path | None]:
-    candidates = [ts2vec_dir.expanduser().resolve()] if ts2vec_dir is not None else []
-    candidates.extend(path for path in DEFAULT_TS2VEC_PATHS if path not in candidates)
-
-    for candidate in candidates:
-        if (candidate / "ts2vec.py").is_file():
-            sys.path.insert(0, str(candidate))
-            from ts2vec import TS2Vec
-
-            return TS2Vec, candidate
-
-    try:
-        from ts2vec import TS2Vec
-
-        return TS2Vec, None
-    except ImportError as exc:
-        searched = "\n  - ".join(str(path) for path in candidates)
-        raise SystemExit(
-            "Could not import the official TS2Vec implementation.\n"
-            "Clone it and pass the path, for example:\n"
-            "  git clone https://github.com/zhihanyue/ts2vec.git vendor/ts2vec\n"
-            "  uv run scripts/train_ts2vec.py --ts2vec-dir vendor/ts2vec\n\n"
-            f"Searched:\n  - {searched}"
-        ) from exc
-
-
-def resolve_device(device: str | None) -> str:
-    if device is not None:
-        return device
-    return "cuda:0" if torch.cuda.is_available() else "cpu"
-
-
 def validate_args(args: argparse.Namespace) -> None:
-    if args.train_fraction <= 0 or args.train_fraction > 1:
-        raise SystemExit("--train-fraction must be in the interval (0, 1].")
+    if args.fallback_train_fraction <= 0 or args.fallback_train_fraction > 1:
+        raise SystemExit("--fallback-train-fraction must be in the interval (0, 1].")
     if args.limit_series is not None and args.limit_series <= 0:
         raise SystemExit("--limit-series must be positive.")
     if args.epochs is None and args.iters is None:
         raise SystemExit("At least one of --epochs or --iters must be set.")
     if args.max_train_length is not None and args.max_train_length < 0:
         raise SystemExit("--max-train-length must be non-negative.")
+    if args.min_train_points <= 1:
+        raise SystemExit("--min-train-points must be greater than 1.")
 
 
 def normalize_max_train_length(value: int | None) -> int | None:
@@ -196,13 +184,14 @@ def make_output_dir(output_dir: Path | None) -> Path:
     return output_dir
 
 
-def compute_prefix_length(series_length: int, train_fraction: float) -> int:
-    return max(2, int(np.ceil(series_length * train_fraction)))
-
-
 def series_to_arrays(
     dataset: dict[str, Any],
-    train_fraction: float,
+    label_windows: dict[str, Any],
+    fallback_train_fraction: float,
+    train_mode: str,
+    min_train_points: int,
+    allow_contaminated_train: bool,
+    missing_labels_as_normal: bool,
     normalization: str,
 ) -> tuple[np.ndarray, list[dict[str, Any]]]:
     names = list(dataset)
@@ -212,8 +201,24 @@ def series_to_arrays(
     for name in names:
         frame = dataset[name]
         full_series = frame["value"].to_numpy(dtype=np.float32)
-        train_len = compute_prefix_length(len(full_series), train_fraction)
-        series = full_series[:train_len]
+        labels = labels_for_series(
+            label_windows,
+            name,
+            frame["timestamp"],
+            missing_labels_as_normal=missing_labels_as_normal,
+        )
+        try:
+            training_window = select_training_window(
+                n_points=len(full_series),
+                labels=labels,
+                fallback_train_fraction=fallback_train_fraction,
+                mode=train_mode,
+                min_length=min_train_points,
+                allow_contaminated=allow_contaminated_train,
+            )
+        except ValueError as exc:
+            raise SystemExit(f"{name}: {exc}") from exc
+        series = full_series[: training_window.end]
         if len(series) < 2:
             continue
         values.append(series)
@@ -222,7 +227,8 @@ def series_to_arrays(
                 "name": name,
                 "original_length": int(len(frame)),
                 "train_length": int(len(series)),
-                "train_fraction": float(train_fraction),
+                "fallback_train_fraction": float(fallback_train_fraction),
+                "training_window": training_window.to_dict(),
                 "start_timestamp": frame["timestamp"].iloc[0].isoformat(),
                 "end_timestamp": frame["timestamp"].iloc[len(series) - 1].isoformat(),
             }
@@ -337,13 +343,7 @@ def main() -> None:
     args = parse_args()
     validate_args(args)
 
-    if args.train_fraction >= 0.999:
-        print(
-            "WARNING: --train-fraction is 1.0, so TS2Vec will train on the full series, "
-            "including any anomalies present in NAB. This is usually not recommended for AD."
-        )
-
-    device = resolve_device(args.device)
+    device = resolve_torch_device(args.device)
     max_train_length = normalize_max_train_length(args.max_train_length)
 
     np.random.seed(args.seed)
@@ -357,13 +357,26 @@ def main() -> None:
     dataset = load_dataset(args.dataset_dir, args.categories)
     if args.limit_series is not None:
         dataset = dict(list(dataset.items())[: args.limit_series])
+    labels_file = find_labels_file(
+        args.labels_file,
+        dataset_dir=args.dataset_dir,
+        auto_download=not args.no_download_labels and not args.missing_labels_as_normal,
+    )
+    label_windows = load_label_windows(labels_file)
     train_data, series_metadata = series_to_arrays(
         dataset,
-        train_fraction=args.train_fraction,
+        label_windows=label_windows,
+        fallback_train_fraction=args.fallback_train_fraction,
+        train_mode=args.train_mode,
+        min_train_points=args.min_train_points,
+        allow_contaminated_train=args.allow_contaminated_train,
+        missing_labels_as_normal=args.missing_labels_as_normal,
         normalization=args.normalization,
     )
 
-    print(f"Loaded {train_data.shape[0]} series with padded training-prefix shape {train_data.shape}.")
+    print(
+        f"Loaded {train_data.shape[0]} series with padded training-prefix shape {train_data.shape}."
+    )
     preflight_memory_check(
         train_data=train_data,
         batch_size=args.batch_size,
@@ -399,12 +412,15 @@ def main() -> None:
         output_dir / "metadata.json",
         {
             "dataset_dir": str(args.dataset_dir.expanduser().resolve()),
+            "labels_file": None if labels_file is None else str(labels_file),
             "categories": args.categories,
             "ts2vec_source": None if ts2vec_source is None else str(ts2vec_source),
             "device": device,
             "train_shape": list(train_data.shape),
             "normalization": args.normalization,
-            "train_fraction": args.train_fraction,
+            "train_mode": args.train_mode,
+            "fallback_train_fraction": args.fallback_train_fraction,
+            "allow_contaminated_train": args.allow_contaminated_train,
             "effective_max_train_length": max_train_length,
             "model_path": str(model_path),
             "loss_log_path": str(output_dir / "loss_log.npy"),
