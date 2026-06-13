@@ -41,3 +41,20 @@ results/<run_id>/ts2vec/
 
 Reported event/window metrics use NAB anomaly windows, but they are not the official NAB
 score.
+
+## Analyze Results
+
+Analyze the latest complete baseline and TS2Vec run:
+
+```console
+uv run python scripts/analyze_results.py
+```
+
+Analyze a specific run:
+
+```console
+uv run python scripts/analyze_results.py --run-dir results/<run_id>
+```
+
+The script writes CSV statistics, a Markdown report, and PNG plots to
+`results/<run_id>/analysis/`.

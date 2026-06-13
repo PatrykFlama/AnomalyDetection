@@ -6,6 +6,7 @@ readme = "README.md"
 requires-python = ">=3.12"
 dependencies = [
     "kagglehub>=0.3.13",
+    "matplotlib>=3.10.5",
     "numpy>=2.4.6",
     "pandas>=3.0.3",
     "scikit-learn>=1.9.0",
