@@ -19,7 +19,7 @@ RESULTS_DIR = PROJECT_ROOT / "results"
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Run baselines, TS2Vec and combined summary.")
     parser.add_argument("--dataset-dir", type=Path, default=DATASET_DIR)
-    parser.add_argument("--categories", nargs="+", default=["realKnownCause"])
+    parser.add_argument("--categories", nargs="+", default=None)
     parser.add_argument("--limit-series", type=int, default=None)
     parser.add_argument("--output-dir", type=Path, default=None)
     parser.add_argument("--methods", nargs="+", default=["all"])
@@ -52,7 +52,8 @@ def make_output_dir(path: Path | None) -> Path:
 
 def add_common_args(command: list[str], args: argparse.Namespace) -> None:
     command.extend(["--dataset-dir", str(args.dataset_dir)])
-    command.extend(["--categories", *args.categories])
+    if args.categories is not None:
+        command.extend(["--categories", *args.categories])
     command.extend(["--seed", str(args.seed)])
     command.extend(["--split-seed", str(args.split_seed)])
     command.extend(["--validation-fraction", str(args.validation_fraction)])
@@ -101,8 +102,6 @@ def run_ts2vec(args: argparse.Namespace, output_dir: Path) -> Path:
         str(PROJECT_ROOT / "scripts" / "train_ts2vec.py"),
         "--dataset-dir",
         str(args.dataset_dir),
-        "--categories",
-        *args.categories,
         "--output-dir",
         str(train_dir),
         "--iters",
@@ -114,6 +113,8 @@ def run_ts2vec(args: argparse.Namespace, output_dir: Path) -> Path:
         "--seed",
         str(args.seed),
     ]
+    if args.categories is not None:
+        train_command.extend(["--categories", *args.categories])
     if args.limit_series is not None:
         train_command.extend(["--limit-series", str(args.limit_series)])
     if args.device is not None:
@@ -129,8 +130,6 @@ def run_ts2vec(args: argparse.Namespace, output_dir: Path) -> Path:
         str(train_dir),
         "--dataset-dir",
         str(args.dataset_dir),
-        "--categories",
-        *args.categories,
         "--output-dir",
         str(eval_dir),
         "--split-seed",
@@ -142,6 +141,8 @@ def run_ts2vec(args: argparse.Namespace, output_dir: Path) -> Path:
         "--threshold-quantiles",
         *[str(value) for value in args.threshold_quantiles],
     ]
+    if args.categories is not None:
+        eval_command.extend(["--categories", *args.categories])
     if args.limit_series is not None:
         eval_command.extend(["--limit-series", str(args.limit_series)])
     if args.device is not None:

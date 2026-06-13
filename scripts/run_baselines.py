@@ -50,7 +50,7 @@ def parse_args() -> argparse.Namespace:
         )
     )
     parser.add_argument("--dataset-dir", type=Path, default=DATASET_DIR)
-    parser.add_argument("--categories", nargs="+", default=["realKnownCause"])
+    parser.add_argument("--categories", nargs="+", default=None)
     parser.add_argument("--limit-series", type=int, default=None)
     parser.add_argument("--methods", nargs="+", default=list(METHODS))
     parser.add_argument("--labels-file", type=Path, default=None)

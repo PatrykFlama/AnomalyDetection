@@ -15,8 +15,10 @@ git clone https://github.com/zhihanyue/ts2vec.git ..\ts2vec
 ## Run Everything
 
 ```powershell
-uv run python scripts\run_experiment.py --categories realKnownCause --ts2vec-dir ..\ts2vec
+uv run python scripts\run_experiment.py --ts2vec-dir ..\ts2vec
 ```
+
+This runs all NAB categories by default. Use `--categories` to select a subset.
 
 Fast smoke test:
 
