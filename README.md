@@ -60,3 +60,6 @@ uv run python scripts/analyze_results.py --run-dir results/<run_id>
 
 The script writes CSV statistics, a Markdown report, and PNG plots to
 `results/<run_id>/analysis/`.
+
+NAB visual audit:
+https://colab.research.google.com/drive/1XaCqNpYcEjAytN1z7weSUp-F5b_zLJX1?usp=sharing
