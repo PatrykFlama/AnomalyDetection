@@ -198,8 +198,12 @@ def score_method(
     training_windows: dict[str, TrainingWindow],
     args: argparse.Namespace,
     output_dir: Path,
-) -> tuple[list[SeriesScores], float]:
+) -> tuple[list[SeriesScores], dict[str, float | int | None]]:
     started = time.perf_counter()
+    training_seconds = 0.0
+    inference_seconds = 0.0
+    inference_points = 0
+    parameter_counts = []
     series_scores: list[SeriesScores] = []
     scores_dir = output_dir / "scores" / split_name / method
     if args.save_scores:
@@ -218,8 +222,14 @@ def score_method(
             device=args.device,
             seed=args.seed,
         )
+        fit_started = time.perf_counter()
         detector.fit(values, training_windows[name].end)
+        training_seconds += time.perf_counter() - fit_started
+        score_started = time.perf_counter()
         scores = detector.score(values)
+        inference_seconds += time.perf_counter() - score_started
+        inference_points += len(values)
+        parameter_counts.append(detector.parameter_count())
         labels = labels_for_series(
             label_windows,
             name,
@@ -246,7 +256,17 @@ def score_method(
                 train_end=training_windows[name].end,
             )
 
-    return series_scores, time.perf_counter() - started
+    return series_scores, {
+        "elapsed_seconds": time.perf_counter() - started,
+        "training_seconds": training_seconds,
+        "inference_seconds": inference_seconds,
+        "inference_points": inference_points,
+        "inference_seconds_per_point": (
+            inference_seconds / inference_points if inference_points else None
+        ),
+        "parameter_count_mean": (float(np.mean(parameter_counts)) if parameter_counts else None),
+        "parameter_count_max": (int(max(parameter_counts)) if parameter_counts else None),
+    }
 
 
 def evaluate_scores(
@@ -298,7 +318,7 @@ def tune_threshold_quantile(
 def summary_row(
     method: str,
     split_name: str,
-    elapsed_seconds: float,
+    operational: dict[str, float | int | None],
     threshold_quantile: float,
     metrics: dict[str, Any],
 ) -> dict[str, Any]:
@@ -308,7 +328,13 @@ def summary_row(
     return {
         "method": method,
         "split": split_name,
-        "elapsed_seconds": elapsed_seconds,
+        "elapsed_seconds": operational["elapsed_seconds"],
+        "training_seconds": operational["training_seconds"],
+        "inference_seconds": operational["inference_seconds"],
+        "inference_points": operational["inference_points"],
+        "inference_seconds_per_point": operational["inference_seconds_per_point"],
+        "parameter_count_mean": operational["parameter_count_mean"],
+        "parameter_count_max": operational["parameter_count_max"],
         "threshold_quantile": threshold_quantile,
         "threshold_source": metrics["threshold_source"],
         "threshold_scope": metrics["threshold_scope"],
@@ -320,6 +346,8 @@ def summary_row(
         "event_precision": eventwise["precision"],
         "event_recall": eventwise["recall"],
         "event_f1": eventwise["f1"],
+        "event_mean_detection_delay": eventwise["mean_detection_delay"],
+        "event_max_detection_delay": eventwise["max_detection_delay"],
         "point_best_f1_oracle": diagnostics["pointwise_best_f1"]["f1"],
         "event_best_f1_oracle": diagnostics["eventwise_best_f1"]["f1"],
     }
@@ -359,6 +387,8 @@ def per_series_metric_rows(
                 "event_precision": eventwise["precision"],
                 "event_recall": eventwise["recall"],
                 "event_f1": eventwise["f1"],
+                "event_mean_detection_delay": eventwise["mean_detection_delay"],
+                "event_max_detection_delay": eventwise["max_detection_delay"],
                 "event_true_events": eventwise["true_events"],
                 "event_pred_events": eventwise["pred_events"],
                 "event_matched_events": eventwise["matched_events"],
@@ -430,7 +460,7 @@ def run_single_split(
     args: argparse.Namespace,
     output_dir: Path,
 ) -> tuple[dict[str, Any], list[dict[str, Any]]]:
-    scores, elapsed = score_method(
+    scores, operational = score_method(
         method,
         split_name,
         dataset,
@@ -446,7 +476,7 @@ def run_single_split(
     if args.save_scores:
         save_predictions(output_dir, method, split_name, dataset, scores, metrics)
     return (
-        summary_row(method, split_name, elapsed, args.threshold_quantile, metrics),
+        summary_row(method, split_name, operational, args.threshold_quantile, metrics),
         per_series_metric_rows(method, split_name, args.threshold_quantile, metrics),
     )
 
@@ -461,7 +491,7 @@ def run_validation_test(
     args: argparse.Namespace,
     output_dir: Path,
 ) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
-    validation_scores, validation_elapsed = score_method(
+    validation_scores, validation_operational = score_method(
         method,
         "validation",
         validation_dataset,
@@ -489,7 +519,7 @@ def run_validation_test(
             validation_metrics,
         )
 
-    test_scores, test_elapsed = score_method(
+    test_scores, test_operational = score_method(
         method,
         "test",
         test_dataset,
@@ -506,9 +536,9 @@ def run_validation_test(
     return (
         [
             summary_row(
-                method, "validation", validation_elapsed, selected_quantile, validation_metrics
+                method, "validation", validation_operational, selected_quantile, validation_metrics
             ),
-            summary_row(method, "test", test_elapsed, selected_quantile, test_metrics),
+            summary_row(method, "test", test_operational, selected_quantile, test_metrics),
         ],
         [
             *per_series_metric_rows(method, "validation", selected_quantile, validation_metrics),

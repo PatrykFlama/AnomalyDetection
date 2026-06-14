@@ -13,6 +13,7 @@ from __future__ import annotations
 import argparse
 import json
 import sys
+import time
 from datetime import datetime
 from pathlib import Path
 from typing import Any
@@ -339,6 +340,15 @@ def jsonable_args(args: argparse.Namespace, output_dir: Path) -> dict[str, Any]:
     return values
 
 
+def ts2vec_parameter_count(model: Any) -> int:
+    network = getattr(model, "_net", None) or getattr(model, "net", None)
+    if network is None:
+        return 0
+    if hasattr(network, "module"):
+        network = network.module
+    return int(sum(parameter.numel() for parameter in network.parameters()))
+
+
 def main() -> None:
     args = parse_args()
     validate_args(args)
@@ -397,12 +407,15 @@ def main() -> None:
         max_train_length=max_train_length,
         temporal_unit=args.temporal_unit,
     )
+    training_started = time.perf_counter()
     loss_log = model.fit(
         train_data,
         n_epochs=args.epochs,
         n_iters=args.iters,
         verbose=args.verbose,
     )
+    training_seconds = time.perf_counter() - training_started
+    parameter_count = ts2vec_parameter_count(model)
 
     model_path = output_dir / "ts2vec_model.pt"
     model.save(str(model_path))
@@ -417,6 +430,8 @@ def main() -> None:
             "ts2vec_source": None if ts2vec_source is None else str(ts2vec_source),
             "device": device,
             "train_shape": list(train_data.shape),
+            "training_seconds": training_seconds,
+            "parameter_count": parameter_count,
             "normalization": args.normalization,
             "train_mode": args.train_mode,
             "fallback_train_fraction": args.fallback_train_fraction,

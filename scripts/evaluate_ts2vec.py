@@ -6,6 +6,7 @@ from __future__ import annotations
 import argparse
 import json
 import sys
+import time
 from datetime import datetime
 from pathlib import Path
 from typing import Any
@@ -171,6 +172,15 @@ def model_kwargs(metadata: dict[str, Any], device: str, batch_size: int) -> dict
     }
 
 
+def ts2vec_parameter_count(model: Any) -> int:
+    network = getattr(model, "_net", None) or getattr(model, "net", None)
+    if network is None:
+        return 0
+    if hasattr(network, "module"):
+        network = network.module
+    return int(sum(parameter.numel() for parameter in network.parameters()))
+
+
 def series_metadata_map(series_metadata: list[dict[str, Any]] | None) -> dict[str, dict[str, Any]]:
     return {} if series_metadata is None else {item["name"]: item for item in series_metadata}
 
@@ -334,8 +344,10 @@ def score_dataset(
     normalization: str,
     args: argparse.Namespace,
     output_dir: Path,
-) -> list[SeriesScores]:
+) -> tuple[list[SeriesScores], dict[str, float | int | None]]:
     evaluated: list[SeriesScores] = []
+    inference_seconds = 0.0
+    inference_points = 0
     for index, (name, frame) in enumerate(dataset.items(), start=1):
         print(f"[{split_name}/ts2vec] {index}/{len(dataset)} {name}")
         raw_values = frame["value"].to_numpy(dtype=np.float32)
@@ -347,7 +359,10 @@ def score_dataset(
             args.reference_fraction,
         )
         ref_len = reference_length(name, len(values), metadata_by_series, args.reference_fraction)
+        score_started = time.perf_counter()
         scores = score_series(model, values, args, ref_len)
+        inference_seconds += time.perf_counter() - score_started
+        inference_points += len(values)
         labels = labels_for_series(
             label_windows,
             name,
@@ -357,7 +372,13 @@ def score_dataset(
         evaluated.append(SeriesScores(name=name, scores=scores, labels=labels, train_end=ref_len))
         if args.save_scores:
             save_scores(output_dir, split_name, name, frame["timestamp"], scores, labels, ref_len)
-    return evaluated
+    return evaluated, {
+        "inference_seconds": inference_seconds,
+        "inference_points": inference_points,
+        "inference_seconds_per_point": (
+            inference_seconds / inference_points if inference_points else None
+        ),
+    }
 
 
 def evaluate_scores(
@@ -410,6 +431,8 @@ def summary_row(
     split_name: str,
     threshold_quantile: float,
     metrics: dict[str, Any],
+    operational: dict[str, float | int | None],
+    metadata: dict[str, Any],
 ) -> dict[str, Any]:
     pointwise = metrics["aggregate"]["pointwise"]
     eventwise = metrics["aggregate"]["eventwise"]
@@ -417,6 +440,11 @@ def summary_row(
     return {
         "method": "ts2vec",
         "split": split_name,
+        "training_seconds": metadata.get("training_seconds"),
+        "inference_seconds": operational["inference_seconds"],
+        "inference_points": operational["inference_points"],
+        "inference_seconds_per_point": operational["inference_seconds_per_point"],
+        "parameter_count": metadata.get("parameter_count"),
         "threshold_quantile": threshold_quantile,
         "threshold_source": metrics["threshold_source"],
         "threshold_scope": metrics["threshold_scope"],
@@ -428,6 +456,8 @@ def summary_row(
         "event_precision": eventwise["precision"],
         "event_recall": eventwise["recall"],
         "event_f1": eventwise["f1"],
+        "event_mean_detection_delay": eventwise["mean_detection_delay"],
+        "event_max_detection_delay": eventwise["max_detection_delay"],
         "point_best_f1_oracle": diagnostics["pointwise_best_f1"]["f1"],
         "event_best_f1_oracle": diagnostics["eventwise_best_f1"]["f1"],
     }
@@ -466,6 +496,8 @@ def per_series_metric_rows(
                 "event_precision": eventwise["precision"],
                 "event_recall": eventwise["recall"],
                 "event_f1": eventwise["f1"],
+                "event_mean_detection_delay": eventwise["mean_detection_delay"],
+                "event_max_detection_delay": eventwise["max_detection_delay"],
                 "event_true_events": eventwise["true_events"],
                 "event_pred_events": eventwise["pred_events"],
                 "event_matched_events": eventwise["matched_events"],
@@ -567,6 +599,7 @@ def main() -> None:
     device = resolve_torch_device(args.device)
     model = TS2Vec(**model_kwargs(metadata, device, args.batch_size))
     model.load(str(model_path))
+    metadata.setdefault("parameter_count", ts2vec_parameter_count(model))
 
     labels_file = find_labels_file(
         args.labels_file,
@@ -595,6 +628,8 @@ def main() -> None:
         categories=categories,
         normalization=normalization,
     )
+    result_metadata["training_seconds"] = metadata.get("training_seconds")
+    result_metadata["parameter_count"] = metadata.get("parameter_count")
     save_json(
         output_dir / "config.json",
         {
@@ -615,7 +650,7 @@ def main() -> None:
 
     if args.split == "all":
         validation_dataset = subset_dataset(dataset, split.validation)
-        validation_scores = score_dataset(
+        validation_scores, validation_operational = score_dataset(
             model,
             "validation",
             validation_dataset,
@@ -643,7 +678,7 @@ def main() -> None:
             )
 
         test_dataset = subset_dataset(dataset, split.test)
-        test_scores = score_dataset(
+        test_scores, test_operational = score_dataset(
             model,
             "test",
             test_dataset,
@@ -660,8 +695,14 @@ def main() -> None:
 
         summary_rows.extend(
             [
-                summary_row("validation", selected_quantile, validation_metrics),
-                summary_row("test", selected_quantile, test_metrics),
+                summary_row(
+                    "validation",
+                    selected_quantile,
+                    validation_metrics,
+                    validation_operational,
+                    metadata,
+                ),
+                summary_row("test", selected_quantile, test_metrics, test_operational, metadata),
             ]
         )
         per_series_rows.extend(
@@ -673,7 +714,7 @@ def main() -> None:
     else:
         split_names = split.validation if args.split == "validation" else split.test
         selected_dataset = subset_dataset(dataset, split_names)
-        scores = score_dataset(
+        scores, operational = score_dataset(
             model,
             args.split,
             selected_dataset,
@@ -688,7 +729,9 @@ def main() -> None:
         save_json(output_dir / "metrics_ts2vec.json", metrics)
         if args.save_scores:
             save_predictions(output_dir, args.split, selected_dataset, scores, metrics)
-        summary_rows.append(summary_row(args.split, args.threshold_quantile, metrics))
+        summary_rows.append(
+            summary_row(args.split, args.threshold_quantile, metrics, operational, metadata)
+        )
         per_series_rows.extend(per_series_metric_rows(args.split, args.threshold_quantile, metrics))
 
     summary = pd.DataFrame(summary_rows).sort_values(["split", "event_f1"], ascending=False)

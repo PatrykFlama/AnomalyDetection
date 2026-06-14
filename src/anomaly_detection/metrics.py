@@ -125,7 +125,7 @@ def event_counts(
 ) -> dict[str, int]:
     true_events = contiguous_events(labels)
     pred_events = contiguous_events(pred)
-    candidates: list[tuple[int, int, int]] = []
+    candidates: list[tuple[int, int, int, int]] = []
     for true_index, true_event in enumerate(true_events):
         for pred_index, pred_event in enumerate(pred_events):
             overlap, true_fraction, pred_fraction = event_overlap(true_event, pred_event)
@@ -134,15 +134,21 @@ def event_counts(
                 and true_fraction >= min_true_overlap_fraction
                 and pred_fraction >= min_pred_overlap_fraction
             ):
-                candidates.append((overlap, true_index, pred_index))
+                detection_index = max(true_event[0], pred_event[0])
+                detection_delay = detection_index - true_event[0]
+                candidates.append((overlap, detection_delay, true_index, pred_index))
 
     matched_true: set[int] = set()
     matched_pred: set[int] = set()
-    for _, true_index, pred_index in sorted(candidates, reverse=True):
+    detection_delays = []
+    for _, detection_delay, true_index, pred_index in sorted(
+        candidates, key=lambda item: (-item[0], item[1])
+    ):
         if true_index in matched_true or pred_index in matched_pred:
             continue
         matched_true.add(true_index)
         matched_pred.add(pred_index)
+        detection_delays.append(detection_delay)
 
     matched = len(matched_true)
     return {
@@ -151,17 +157,28 @@ def event_counts(
         "matched_events": matched,
         "fp_events": len(pred_events) - matched,
         "fn_events": len(true_events) - matched,
+        "detection_delay_sum": int(sum(detection_delays)),
+        "detection_delay_max": int(max(detection_delays)) if detection_delays else 0,
     }
 
 
-def event_metrics_from_counts(counts: dict[str, int]) -> dict[str, float | int]:
+def event_metrics_from_counts(counts: dict[str, int]) -> dict[str, float | int | None]:
     matched = counts["matched_events"]
     pred_events = counts["pred_events"]
     true_events = counts["true_events"]
     precision = matched / pred_events if pred_events else 0.0
     recall = matched / true_events if true_events else 0.0
     f1 = 2 * precision * recall / (precision + recall) if precision + recall else 0.0
-    return {"precision": precision, "recall": recall, "f1": f1, **counts}
+    mean_delay = counts["detection_delay_sum"] / matched if matched else None
+    max_delay = counts["detection_delay_max"] if matched else None
+    return {
+        "precision": precision,
+        "recall": recall,
+        "f1": f1,
+        "mean_detection_delay": mean_delay,
+        "max_detection_delay": max_delay,
+        **counts,
+    }
 
 
 def event_metrics(
@@ -219,6 +236,8 @@ def sweep_event_f1(
             "matched_events": 0,
             "fp_events": 0,
             "fn_events": 0,
+            "detection_delay_sum": 0,
+            "detection_delay_max": 0,
         }
         for item in series:
             item_counts = event_counts(
@@ -229,7 +248,10 @@ def sweep_event_f1(
                 min_pred_overlap_fraction=min_pred_overlap_fraction,
             )
             for key in counts:
-                counts[key] += item_counts[key]
+                if key == "detection_delay_max":
+                    counts[key] = max(counts[key], item_counts[key])
+                else:
+                    counts[key] += item_counts[key]
         metrics = event_metrics_from_counts(counts)
         if metrics["f1"] > best["f1"]:
             best = {"threshold": float(threshold), **metrics}
@@ -245,11 +267,16 @@ def aggregate_event_metrics(
         "matched_events": 0,
         "fp_events": 0,
         "fn_events": 0,
+        "detection_delay_sum": 0,
+        "detection_delay_max": 0,
     }
     for item in series:
         item_counts = event_counts(item.labels, predict(item.scores, threshold))
         for key in counts:
-            counts[key] += item_counts[key]
+            if key == "detection_delay_max":
+                counts[key] = max(counts[key], item_counts[key])
+            else:
+                counts[key] += item_counts[key]
     return event_metrics_from_counts(counts)
 
 
@@ -263,18 +290,33 @@ def aggregate_event_metrics_with_thresholds(
         "matched_events": 0,
         "fp_events": 0,
         "fn_events": 0,
+        "detection_delay_sum": 0,
+        "detection_delay_max": 0,
     }
     for item in series:
         item_counts = event_counts(item.labels, predict(item.scores, thresholds[item.name]))
         for key in counts:
-            counts[key] += item_counts[key]
+            if key == "detection_delay_max":
+                counts[key] = max(counts[key], item_counts[key])
+            else:
+                counts[key] += item_counts[key]
     return event_metrics_from_counts(counts)
 
 
 def macro_average(items: list[dict[str, Any]]) -> dict[str, float | None]:
     keys = sorted({key for item in items for key in item})
     output: dict[str, float | None] = {}
-    sum_keys = {"support", "tp", "tn", "fp", "fn", "true_events", "pred_events", "matched_events"}
+    sum_keys = {
+        "support",
+        "tp",
+        "tn",
+        "fp",
+        "fn",
+        "true_events",
+        "pred_events",
+        "matched_events",
+        "detection_delay_sum",
+    }
     for key in keys:
         values = [item[key] for item in items if item.get(key) is not None]
         if not values:

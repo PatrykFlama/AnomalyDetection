@@ -264,6 +264,88 @@ def save_training_loss(plt, run_dir: Path, output_dir: Path) -> bool:
     return True
 
 
+def load_prediction_outputs(run_dir: Path) -> pd.DataFrame:
+    paths = [
+        *sorted((run_dir / "baselines" / "predictions").glob("test_*.csv")),
+        run_dir / "ts2vec" / "evaluation" / "predictions" / "test_ts2vec.csv",
+    ]
+    frames = [pd.read_csv(path) for path in paths if path.is_file()]
+    if not frames:
+        return pd.DataFrame()
+    predictions = pd.concat(frames, ignore_index=True, sort=False)
+    required = {"method", "series", "index", "value", "label", "prediction"}
+    if missing := required - set(predictions.columns):
+        raise SystemExit(f"Prediction files are missing columns: {sorted(missing)}")
+    return predictions
+
+
+def save_qualitative_detection_examples(
+    plt,
+    run_dir: Path,
+    test_summary: pd.DataFrame,
+    output_dir: Path,
+    max_panels: int = 4,
+) -> bool:
+    predictions = load_prediction_outputs(run_dir)
+    if predictions.empty:
+        return False
+
+    if "split" in predictions:
+        predictions = predictions[predictions["split"] == "test"]
+    methods = test_summary.sort_values("event_f1", ascending=False)["method"].tolist()
+    panels = []
+    for method in methods:
+        method_rows = predictions[predictions["method"] == method].copy()
+        if method_rows.empty:
+            continue
+        method_rows["interesting"] = (
+            (method_rows["label"] == 1) | (method_rows["prediction"] == 1)
+        ).astype(int)
+        series_counts = (
+            method_rows.groupby("series")["interesting"].sum().sort_values(ascending=False)
+        )
+        if series_counts.empty or series_counts.iloc[0] == 0:
+            continue
+        series = series_counts.index[0]
+        panels.append((method, series, method_rows[method_rows["series"] == series].copy()))
+        if len(panels) >= max_panels:
+            break
+
+    if not panels:
+        return False
+
+    figure, axes = plt.subplots(len(panels), 1, figsize=(12, 3.2 * len(panels)), sharex=False)
+    axes = np.atleast_1d(axes)
+    colors = {"TP": "#54A24B", "FP": "#E45756", "FN": "#F8A44C"}
+    for axis, (method, series, frame) in zip(axes, panels, strict=True):
+        frame = frame.sort_values("index")
+        axis.plot(frame["index"], frame["value"], color="#4C566A", linewidth=1.1)
+        classes = {
+            "TP": (frame["label"] == 1) & (frame["prediction"] == 1),
+            "FP": (frame["label"] == 0) & (frame["prediction"] == 1),
+            "FN": (frame["label"] == 1) & (frame["prediction"] == 0),
+        }
+        for label, mask in classes.items():
+            selected = frame[mask]
+            if not selected.empty:
+                axis.scatter(
+                    selected["index"],
+                    selected["value"],
+                    s=18,
+                    color=colors[label],
+                    label=label,
+                    zorder=3,
+                )
+        axis.set_title(f"{method}: {Path(series).stem}")
+        axis.set_xlabel("Index")
+        axis.set_ylabel("Value")
+        axis.legend(loc="upper right", ncols=3, fontsize=8)
+    figure.tight_layout()
+    figure.savefig(output_dir / "qualitative_detection_examples.png", dpi=180)
+    plt.close(figure)
+    return True
+
+
 def markdown_table(frame: pd.DataFrame, columns: list[str]) -> str:
     selected = frame[columns].copy()
     for column in selected.select_dtypes(include="number"):
@@ -287,6 +369,7 @@ def write_report(
     test_summary: pd.DataFrame,
     statistics: pd.DataFrame,
     has_loss_plot: bool,
+    has_qualitative_plot: bool,
 ) -> None:
     ranked = test_summary.sort_values("point_f1", ascending=False)
     leaders = {
@@ -303,6 +386,8 @@ def write_report(
     ]
     if has_loss_plot:
         figure_names.append("ts2vec_training_loss.png")
+    if has_qualitative_plot:
+        figure_names.append("qualitative_detection_examples.png")
 
     lines = [
         f"# Results Analysis: {run_dir.name}",
@@ -373,7 +458,12 @@ def write_report(
         *[
             item
             for name in figure_names
-            for item in (f"### {Path(name).stem.replace('_', ' ').title()}", "", f"![{name}]({name})", "")
+            for item in (
+                f"### {Path(name).stem.replace('_', ' ').title()}",
+                "",
+                f"![{name}]({name})",
+                "",
+            )
         ],
         "",
         "Reported event metrics use NAB windows but are not the official NAB score.",
@@ -414,6 +504,9 @@ def main() -> None:
     save_heatmap(plt, per_series_test, "event_f1", output_dir)
     save_threshold_diagnostics(plt, test_summary, output_dir)
     has_loss_plot = save_training_loss(plt, run_dir, output_dir)
+    has_qualitative_plot = save_qualitative_detection_examples(
+        plt, run_dir, test_summary, output_dir
+    )
     write_report(
         run_dir,
         output_dir,
@@ -421,6 +514,7 @@ def main() -> None:
         test_summary,
         statistics,
         has_loss_plot,
+        has_qualitative_plot,
     )
 
     print(f"Analyzed run: {run_dir}")

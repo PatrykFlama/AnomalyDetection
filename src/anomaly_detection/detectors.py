@@ -33,6 +33,9 @@ class Detector:
     def score(self, values: np.ndarray) -> np.ndarray:
         raise NotImplementedError
 
+    def parameter_count(self) -> int:
+        return 0
+
 
 @dataclass
 class RobustZScoreDetector(Detector):
@@ -207,6 +210,11 @@ class MLPAutoencoderDetector(Detector):
                 errors.append(torch.mean((reconstructed - batch) ** 2, dim=1).cpu().numpy())
         return window_scores_to_points(len(values), self.window_, np.concatenate(errors))
 
+    def parameter_count(self) -> int:
+        if self.model_ is None:
+            return 0
+        return int(sum(parameter.numel() for parameter in self.model_.parameters()))
+
 
 @dataclass
 class RNNPredictorDetector(Detector):
@@ -267,6 +275,11 @@ class RNNPredictorDetector(Detector):
                 target = targets[start : start + len(prediction)]
                 errors.append((prediction - target) ** 2)
         return prediction_errors_to_points(len(values), self.window_, np.concatenate(errors))
+
+    def parameter_count(self) -> int:
+        if self.model_ is None:
+            return 0
+        return int(sum(parameter.numel() for parameter in self.model_.parameters()))
 
 
 def build_detector(

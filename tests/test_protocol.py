@@ -11,7 +11,11 @@ SRC_DIR = PROJECT_ROOT / "src"
 if str(SRC_DIR) not in sys.path:
     sys.path.insert(0, str(SRC_DIR))
 
-from anomaly_detection.metrics import SeriesScores, evaluate_series_scores  # noqa: E402
+from anomaly_detection.metrics import (  # noqa: E402
+    SeriesScores,
+    evaluate_series_scores,
+    event_metrics,
+)
 from anomaly_detection.protocol import select_training_window  # noqa: E402
 
 
@@ -82,6 +86,16 @@ class EvaluationProtocolTest(unittest.TestCase):
         self.assertEqual(metrics["aggregate"]["pointwise"]["fp"], 0)
         self.assertEqual(metrics["aggregate"]["pointwise"]["support"], 1)
         self.assertEqual(metrics["per_series"][0]["n_evaluation_points"], 1)
+
+    def test_event_metrics_report_detection_delay(self) -> None:
+        labels = np.array([0, 1, 1, 1, 0, 0], dtype=np.int8)
+        scores = np.array([0.0, 0.0, 0.1, 3.0, 0.0, 0.0], dtype=np.float32)
+
+        metrics = event_metrics(labels, scores, threshold=1.0)
+
+        self.assertEqual(metrics["matched_events"], 1)
+        self.assertEqual(metrics["mean_detection_delay"], 2.0)
+        self.assertEqual(metrics["max_detection_delay"], 2)
 
 
 if __name__ == "__main__":

@@ -3,6 +3,8 @@ data/
 training/
 evaluation/
 results/
+outputs/
+wandb/
 
 # Python environments and caches
 .venv/
