@@ -15,6 +15,7 @@ from anomaly_detection.metrics import (  # noqa: E402
     SeriesScores,
     evaluate_series_scores,
     event_metrics,
+    postprocess_predictions,
 )
 from anomaly_detection.protocol import select_training_window  # noqa: E402
 
@@ -96,6 +97,55 @@ class EvaluationProtocolTest(unittest.TestCase):
         self.assertEqual(metrics["matched_events"], 1)
         self.assertEqual(metrics["mean_detection_delay"], 2.0)
         self.assertEqual(metrics["max_detection_delay"], 2)
+
+    def test_alarm_postprocessing_merges_filters_and_applies_cooldown(self) -> None:
+        pred = np.array([0, 1, 0, 1, 1, 0, 0, 1, 1, 0, 0, 1, 1], dtype=np.int8)
+
+        processed = postprocess_predictions(
+            pred,
+            min_event_length=2,
+            merge_gap=1,
+            cooldown=3,
+        )
+
+        np.testing.assert_array_equal(
+            processed,
+            np.array([0, 1, 1, 1, 1, 0, 0, 0, 0, 0, 0, 1, 1], dtype=np.int8),
+        )
+
+    def test_peak_window_alerting_marks_only_peak_neighborhood(self) -> None:
+        pred = np.array([0, 1, 1, 1, 1, 1, 0], dtype=np.int8)
+        scores = np.array([0.0, 2.0, 3.0, 9.0, 4.0, 1.0, 0.0], dtype=np.float32)
+
+        processed = postprocess_predictions(
+            pred,
+            scores=scores,
+            alert_mode="peak_window",
+            alert_window=3,
+        )
+
+        np.testing.assert_array_equal(
+            processed,
+            np.array([0, 0, 1, 1, 1, 0, 0], dtype=np.int8),
+        )
+
+    def test_peak_window_alerting_can_emit_multiple_separated_peaks(self) -> None:
+        pred = np.ones(12, dtype=np.int8)
+        scores = np.array([0, 1, 8, 2, 1, 0, 1, 7, 1, 0, 6, 0], dtype=np.float32)
+
+        processed = postprocess_predictions(
+            pred,
+            scores=scores,
+            alert_mode="peak_window",
+            alert_window=3,
+            max_alerts_per_event=2,
+            peak_min_distance=4,
+        )
+
+        np.testing.assert_array_equal(
+            processed,
+            np.array([0, 1, 1, 1, 0, 0, 1, 1, 1, 0, 0, 0], dtype=np.int8),
+        )
 
 
 if __name__ == "__main__":

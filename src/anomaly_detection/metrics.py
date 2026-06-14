@@ -29,8 +29,198 @@ def contiguous_events(binary: np.ndarray) -> list[tuple[int, int]]:
     return [(int(start), int(end)) for start, end in zip(starts, ends, strict=True)]
 
 
-def predict(scores: np.ndarray, threshold: float) -> np.ndarray:
-    return (np.asarray(scores) > threshold).astype(np.int8)
+def _validate_event_postprocessing(
+    min_event_length: int,
+    merge_gap: int,
+    cooldown: int,
+    alert_mode: str,
+    alert_window: int,
+    max_alerts_per_event: int,
+    peak_min_distance: int | None,
+) -> None:
+    if min_event_length < 1:
+        raise ValueError("min_event_length must be at least 1")
+    if merge_gap < 0:
+        raise ValueError("merge_gap must be non-negative")
+    if cooldown < 0:
+        raise ValueError("cooldown must be non-negative")
+    if alert_mode not in {"full_event", "peak_window"}:
+        raise ValueError("alert_mode must be 'full_event' or 'peak_window'")
+    if alert_window < 1:
+        raise ValueError("alert_window must be at least 1")
+    if max_alerts_per_event < 1:
+        raise ValueError("max_alerts_per_event must be at least 1")
+    if peak_min_distance is not None and peak_min_distance < 1:
+        raise ValueError("peak_min_distance must be at least 1 when provided")
+
+
+def postprocess_prediction_events(
+    pred: np.ndarray,
+    min_event_length: int = 1,
+    merge_gap: int = 0,
+    cooldown: int = 0,
+) -> list[tuple[int, int]]:
+    pred_bool = np.asarray(pred, dtype=bool)
+    events = contiguous_events(pred_bool)
+    if not events:
+        return []
+
+    if merge_gap > 0:
+        merged = [events[0]]
+        for start, end in events[1:]:
+            previous_start, previous_end = merged[-1]
+            if start - previous_end <= merge_gap:
+                merged[-1] = (previous_start, end)
+            else:
+                merged.append((start, end))
+        events = merged
+
+    if min_event_length > 1:
+        events = [(start, end) for start, end in events if end - start >= min_event_length]
+
+    if cooldown > 0:
+        kept: list[tuple[int, int]] = []
+        suppress_until = -1
+        for start, end in events:
+            if start < suppress_until:
+                continue
+            kept.append((start, end))
+            suppress_until = end + cooldown
+        events = kept
+
+    return events
+
+
+def materialize_alerts(
+    events: list[tuple[int, int]],
+    n_points: int,
+    scores: np.ndarray | None = None,
+    alert_mode: str = "full_event",
+    alert_window: int = 1,
+    max_alerts_per_event: int = 1,
+    peak_min_distance: int | None = None,
+) -> np.ndarray:
+    output = np.zeros(n_points, dtype=np.int8)
+    if not events:
+        return output
+
+    if alert_mode == "full_event":
+        for start, end in events:
+            output[start:end] = 1
+        return output
+
+    if scores is None:
+        raise ValueError("scores are required when alert_mode='peak_window'")
+    score_values = np.asarray(scores, dtype=np.float32)
+    if score_values.shape[0] != n_points:
+        raise ValueError("scores and predictions must have the same length")
+
+    before = (alert_window - 1) // 2
+    after = alert_window - 1 - before
+    min_distance = peak_min_distance if peak_min_distance is not None else alert_window
+    for start, end in events:
+        event_scores = score_values[start:end]
+        finite_scores = np.where(np.isfinite(event_scores), event_scores, -np.inf)
+        selected_peaks: list[int] = []
+        if finite_scores.size == 0 or np.all(np.isneginf(finite_scores)):
+            selected_peaks.append(start + max(0, (end - start - 1) // 2))
+        else:
+            candidates = finite_scores.copy()
+            for _ in range(min(max_alerts_per_event, len(candidates))):
+                if np.all(np.isneginf(candidates)):
+                    break
+                local_peak = int(np.argmax(candidates))
+                selected_peaks.append(start + local_peak)
+                suppress_start = max(0, local_peak - min_distance + 1)
+                suppress_end = min(len(candidates), local_peak + min_distance)
+                candidates[suppress_start:suppress_end] = -np.inf
+
+        for peak in selected_peaks:
+            alert_start = max(0, peak - before)
+            alert_end = min(n_points, peak + after + 1)
+            output[alert_start:alert_end] = 1
+    return output
+
+
+def postprocess_predictions(
+    pred: np.ndarray,
+    scores: np.ndarray | None = None,
+    min_event_length: int = 1,
+    merge_gap: int = 0,
+    cooldown: int = 0,
+    alert_mode: str = "full_event",
+    alert_window: int = 1,
+    max_alerts_per_event: int = 1,
+    peak_min_distance: int | None = None,
+) -> np.ndarray:
+    """Convert threshold crossings into operational alarms.
+
+    The event cleanup stage merges nearby threshold crossings, filters very short
+    alarms, and applies cooldown. The alert materialization stage then either
+    emits the full event span or a fixed-size window around the peak score in
+    each kept event. This is deliberately model-agnostic: every detector still
+    produces point scores, and the shared protocol decides how scores become
+    alarms.
+    """
+
+    _validate_event_postprocessing(
+        min_event_length,
+        merge_gap,
+        cooldown,
+        alert_mode,
+        alert_window,
+        max_alerts_per_event,
+        peak_min_distance,
+    )
+    pred_bool = np.asarray(pred, dtype=bool)
+    events = postprocess_prediction_events(
+        pred_bool,
+        min_event_length=min_event_length,
+        merge_gap=merge_gap,
+        cooldown=cooldown,
+    )
+    return materialize_alerts(
+        events,
+        len(pred_bool),
+        scores=scores,
+        alert_mode=alert_mode,
+        alert_window=alert_window,
+        max_alerts_per_event=max_alerts_per_event,
+        peak_min_distance=peak_min_distance,
+    )
+
+
+def predict(
+    scores: np.ndarray,
+    threshold: float,
+    min_event_length: int = 1,
+    merge_gap: int = 0,
+    cooldown: int = 0,
+    alert_mode: str = "full_event",
+    alert_window: int = 1,
+    max_alerts_per_event: int = 1,
+    peak_min_distance: int | None = None,
+) -> np.ndarray:
+    score_values = np.asarray(scores)
+    pred = (score_values > threshold).astype(np.int8)
+    if (
+        min_event_length == 1
+        and merge_gap == 0
+        and cooldown == 0
+        and alert_mode == "full_event"
+    ):
+        return pred
+    return postprocess_predictions(
+        pred,
+        scores=score_values,
+        min_event_length=min_event_length,
+        merge_gap=merge_gap,
+        cooldown=cooldown,
+        alert_mode=alert_mode,
+        alert_window=alert_window,
+        max_alerts_per_event=max_alerts_per_event,
+        peak_min_distance=peak_min_distance,
+    )
 
 
 def choose_threshold(scores: np.ndarray, threshold: float | None, quantile: float) -> float:
@@ -83,8 +273,29 @@ def safe_auc(kind: str, labels: np.ndarray, scores: np.ndarray) -> float | None:
     raise ValueError(kind)
 
 
-def point_metrics(labels: np.ndarray, scores: np.ndarray, threshold: float) -> dict[str, Any]:
-    pred = predict(scores, threshold)
+def point_metrics(
+    labels: np.ndarray,
+    scores: np.ndarray,
+    threshold: float,
+    min_event_length: int = 1,
+    merge_gap: int = 0,
+    cooldown: int = 0,
+    alert_mode: str = "full_event",
+    alert_window: int = 1,
+    max_alerts_per_event: int = 1,
+    peak_min_distance: int | None = None,
+) -> dict[str, Any]:
+    pred = predict(
+        scores,
+        threshold,
+        min_event_length=min_event_length,
+        merge_gap=merge_gap,
+        cooldown=cooldown,
+        alert_mode=alert_mode,
+        alert_window=alert_window,
+        max_alerts_per_event=max_alerts_per_event,
+        peak_min_distance=peak_min_distance,
+    )
     return {
         **binary_metrics(labels, pred),
         "roc_auc": safe_auc("roc_auc", labels, scores),
@@ -188,11 +399,28 @@ def event_metrics(
     min_overlap_points: int = 1,
     min_true_overlap_fraction: float = 0.0,
     min_pred_overlap_fraction: float = 0.0,
+    min_event_length: int = 1,
+    merge_gap: int = 0,
+    cooldown: int = 0,
+    alert_mode: str = "full_event",
+    alert_window: int = 1,
+    max_alerts_per_event: int = 1,
+    peak_min_distance: int | None = None,
 ) -> dict[str, float | int]:
     return event_metrics_from_counts(
         event_counts(
             labels,
-            predict(scores, threshold),
+            predict(
+                scores,
+                threshold,
+                min_event_length=min_event_length,
+                merge_gap=merge_gap,
+                cooldown=cooldown,
+                alert_mode=alert_mode,
+                alert_window=alert_window,
+                max_alerts_per_event=max_alerts_per_event,
+                peak_min_distance=peak_min_distance,
+            ),
             min_overlap_points=min_overlap_points,
             min_true_overlap_fraction=min_true_overlap_fraction,
             min_pred_overlap_fraction=min_pred_overlap_fraction,
@@ -210,10 +438,34 @@ def threshold_grid(scores: np.ndarray, steps: int) -> np.ndarray:
     return np.unique(np.quantile(finite, np.linspace(0.0, 1.0, steps)))
 
 
-def sweep_point_f1(labels: np.ndarray, scores: np.ndarray, steps: int) -> dict[str, Any]:
+def sweep_point_f1(
+    labels: np.ndarray,
+    scores: np.ndarray,
+    steps: int,
+    min_event_length: int = 1,
+    merge_gap: int = 0,
+    cooldown: int = 0,
+    alert_mode: str = "full_event",
+    alert_window: int = 1,
+    max_alerts_per_event: int = 1,
+    peak_min_distance: int | None = None,
+) -> dict[str, Any]:
     best: dict[str, Any] = {"threshold": None, "precision": 0.0, "recall": 0.0, "f1": 0.0}
     for threshold in threshold_grid(scores, steps):
-        metrics = binary_metrics(labels, predict(scores, float(threshold)))
+        metrics = binary_metrics(
+            labels,
+            predict(
+                scores,
+                float(threshold),
+                min_event_length=min_event_length,
+                merge_gap=merge_gap,
+                cooldown=cooldown,
+                alert_mode=alert_mode,
+                alert_window=alert_window,
+                max_alerts_per_event=max_alerts_per_event,
+                peak_min_distance=peak_min_distance,
+            ),
+        )
         if metrics["f1"] > best["f1"]:
             best = {"threshold": float(threshold), **metrics}
     return best
@@ -225,6 +477,13 @@ def sweep_event_f1(
     min_overlap_points: int = 1,
     min_true_overlap_fraction: float = 0.0,
     min_pred_overlap_fraction: float = 0.0,
+    min_event_length: int = 1,
+    merge_gap: int = 0,
+    cooldown: int = 0,
+    alert_mode: str = "full_event",
+    alert_window: int = 1,
+    max_alerts_per_event: int = 1,
+    peak_min_distance: int | None = None,
 ) -> dict[str, Any]:
     series = list(series)
     all_scores = np.concatenate([item.scores for item in series])
@@ -242,7 +501,17 @@ def sweep_event_f1(
         for item in series:
             item_counts = event_counts(
                 item.labels,
-                predict(item.scores, float(threshold)),
+                predict(
+                    item.scores,
+                    float(threshold),
+                    min_event_length=min_event_length,
+                    merge_gap=merge_gap,
+                    cooldown=cooldown,
+                    alert_mode=alert_mode,
+                    alert_window=alert_window,
+                    max_alerts_per_event=max_alerts_per_event,
+                    peak_min_distance=peak_min_distance,
+                ),
                 min_overlap_points=min_overlap_points,
                 min_true_overlap_fraction=min_true_overlap_fraction,
                 min_pred_overlap_fraction=min_pred_overlap_fraction,

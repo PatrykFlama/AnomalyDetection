@@ -265,6 +265,55 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--protocol-min-overlap-points", type=int, default=1)
     parser.add_argument("--protocol-min-true-overlap-fraction", type=float, default=0.0)
     parser.add_argument("--protocol-min-pred-overlap-fraction", type=float, default=0.0)
+    parser.add_argument(
+        "--protocol-min-event-length",
+        type=int,
+        default=1,
+        help="Drop predicted anomaly events shorter than this many points after thresholding.",
+    )
+    parser.add_argument(
+        "--protocol-merge-gap",
+        type=int,
+        default=0,
+        help="Merge predicted anomaly events separated by at most this many normal points.",
+    )
+    parser.add_argument(
+        "--protocol-cooldown",
+        type=int,
+        default=0,
+        help="Suppress new predicted events that start within this many points after a kept event.",
+    )
+    parser.add_argument(
+        "--protocol-alert-mode",
+        choices=("full_event", "peak_window"),
+        default="full_event",
+        help=(
+            "How cleaned-up predicted events become point-wise alerts. "
+            "'full_event' marks the whole event span; 'peak_window' marks only "
+            "a fixed window around the highest score inside each event."
+        ),
+    )
+    parser.add_argument(
+        "--protocol-alert-window",
+        type=int,
+        default=1,
+        help="Number of points to mark around each event peak when using peak-window alerts.",
+    )
+    parser.add_argument(
+        "--protocol-max-alerts-per-event",
+        type=int,
+        default=1,
+        help="Maximum number of separated peak windows to emit inside each cleaned event.",
+    )
+    parser.add_argument(
+        "--protocol-peak-min-distance",
+        type=int,
+        default=None,
+        help=(
+            "Minimum distance between selected peaks inside one cleaned event. "
+            "Defaults to --protocol-alert-window."
+        ),
+    )
     parser.add_argument("--min-train-points", type=int, default=32)
     parser.add_argument("--fallback-train-fraction", type=float, default=0.05)
     parser.add_argument(
@@ -306,6 +355,18 @@ def validate_args(args: argparse.Namespace) -> None:
         raise SystemExit("--protocol-min-true-overlap-fraction must be in [0, 1].")
     if not 0 <= args.protocol_min_pred_overlap_fraction <= 1:
         raise SystemExit("--protocol-min-pred-overlap-fraction must be in [0, 1].")
+    if args.protocol_min_event_length < 1:
+        raise SystemExit("--protocol-min-event-length must be at least 1.")
+    if args.protocol_merge_gap < 0:
+        raise SystemExit("--protocol-merge-gap must be non-negative.")
+    if args.protocol_cooldown < 0:
+        raise SystemExit("--protocol-cooldown must be non-negative.")
+    if args.protocol_alert_window < 1:
+        raise SystemExit("--protocol-alert-window must be at least 1.")
+    if args.protocol_max_alerts_per_event < 1:
+        raise SystemExit("--protocol-max-alerts-per-event must be at least 1.")
+    if args.protocol_peak_min_distance is not None and args.protocol_peak_min_distance < 1:
+        raise SystemExit("--protocol-peak-min-distance must be at least 1 when provided.")
     if not 0 < args.fallback_train_fraction <= 1:
         raise SystemExit("--fallback-train-fraction must be in the interval (0, 1].")
     if args.min_train_points <= 1:
@@ -544,6 +605,13 @@ def protocol_config(args: argparse.Namespace) -> dict[str, Any]:
         "min_overlap_points": args.protocol_min_overlap_points,
         "min_true_overlap_fraction": args.protocol_min_true_overlap_fraction,
         "min_pred_overlap_fraction": args.protocol_min_pred_overlap_fraction,
+        "min_event_length": args.protocol_min_event_length,
+        "merge_gap": args.protocol_merge_gap,
+        "cooldown": args.protocol_cooldown,
+        "alert_mode": args.protocol_alert_mode,
+        "alert_window": args.protocol_alert_window,
+        "max_alerts_per_event": args.protocol_max_alerts_per_event,
+        "peak_min_distance": args.protocol_peak_min_distance,
         "training_scope_cli": args.training_scope,
         "ts2vec_training_scope_override": args.ts2vec_training_scope,
         "evaluation_region": "after_train_end",
@@ -560,6 +628,18 @@ def score_smoothing(scores: np.ndarray, window: int) -> np.ndarray:
         return finite_array(scores)
     smoothed = pd.Series(scores).rolling(window=window, min_periods=1).mean().to_numpy(np.float32)
     return finite_array(smoothed)
+
+
+def prediction_postprocessing_kwargs(args: argparse.Namespace) -> dict[str, int | str]:
+    return {
+        "min_event_length": args.protocol_min_event_length,
+        "merge_gap": args.protocol_merge_gap,
+        "cooldown": args.protocol_cooldown,
+        "alert_mode": args.protocol_alert_mode,
+        "alert_window": args.protocol_alert_window,
+        "max_alerts_per_event": args.protocol_max_alerts_per_event,
+        "peak_min_distance": args.protocol_peak_min_distance,
+    }
 
 
 def safe_series_name(name: str) -> str:
@@ -1460,7 +1540,7 @@ def sample_params(trial: optuna.trial.Trial, model: str) -> dict[str, Any]:
             "depth": trial.suggest_categorical("depth", [4, 6]),
             "batch_size_train": trial.suggest_categorical("batch_size_train", [2, 4]),
             "learning_rate": trial.suggest_float("learning_rate", 3e-4, 1e-3, log=True),
-            "iters": trial.suggest_categorical("iters", [50, 100]),
+            "iters": trial.suggest_categorical("iters", [50, 100, 500, 1000, 2000]),
             "max_train_length": trial.suggest_categorical("max_train_length", [128, 256]),
             "temporal_unit": trial.suggest_categorical("temporal_unit", [0, 1]),
             "score_method": trial.suggest_categorical("score_method", ["knn", "centroid", "mask-diff"]),
@@ -1509,6 +1589,7 @@ def evaluate_scores(
     if not series_scores:
         raise ValueError("No series scores to evaluate.")
     series_info = series_info or {}
+    postprocess_kwargs = prediction_postprocessing_kwargs(context.args)
     thresholds: dict[str, float] = {}
     all_scores = np.concatenate([item.scores[item.train_end :] for item in series_scores])
     all_labels = np.concatenate([item.labels[item.train_end :] for item in series_scores])
@@ -1537,10 +1618,14 @@ def evaluate_scores(
         "detection_delay_sum": 0,
         "detection_delay_max": 0,
     }
+    aggregate_raw_pred_events = 0
     for item in series_scores:
         eval_scores = item.scores[item.train_end :]
         eval_labels = item.labels[item.train_end :]
-        pred = predict(eval_scores, thresholds[item.name])
+        raw_pred = predict(eval_scores, thresholds[item.name])
+        pred = predict(eval_scores, thresholds[item.name], **postprocess_kwargs)
+        raw_pred_events = len(contiguous_events(raw_pred))
+        aggregate_raw_pred_events += raw_pred_events
         all_pred.append(pred)
         counts = event_counts(
             eval_labels,
@@ -1567,6 +1652,7 @@ def evaluate_scores(
                 "n_evaluation_points": int(len(eval_labels)),
                 "n_anomaly_points": int(eval_labels.sum()),
                 "n_true_events": len(contiguous_events(eval_labels)),
+                "n_raw_pred_events": raw_pred_events,
                 "n_pred_events": len(contiguous_events(pred)),
                 "contaminated_train": bool(info.get("contaminated_train", False)),
                 "used_fallback_train_window": bool(info.get("used_fallback_train_window", False)),
@@ -1581,6 +1667,7 @@ def evaluate_scores(
         "pointwise": point_metrics_from_predictions(all_labels, all_scores, np.concatenate(all_pred)),
         "eventwise": event_metrics_from_counts(aggregate_counts),
     }
+    aggregate["eventwise"]["raw_pred_events"] = aggregate_raw_pred_events
     aggregate["pointwise"]["roc_auc"] = safe_auc("roc_auc", all_labels, all_scores)
     aggregate["pointwise"]["pr_auc"] = safe_auc("pr_auc", all_labels, all_scores)
 
@@ -1611,6 +1698,7 @@ def evaluate_scores(
             "min_true_overlap_fraction": context.args.protocol_min_true_overlap_fraction,
             "min_pred_overlap_fraction": context.args.protocol_min_pred_overlap_fraction,
         },
+        "event_postprocessing": postprocess_kwargs,
         "aggregate": aggregate,
         "macro_average": {
             "pointwise": macro_average([item["pointwise"] for item in per_series]),
@@ -1619,13 +1707,19 @@ def evaluate_scores(
         "category_macro": category_macro,
         "category_macro_average": category_macro_average,
         "threshold_diagnostics": {
-            "pointwise_best_f1": sweep_point_f1(all_labels, all_scores, context.args.threshold_sweep_steps),
+            "pointwise_best_f1": sweep_point_f1(
+                all_labels,
+                all_scores,
+                context.args.threshold_sweep_steps,
+                **postprocess_kwargs,
+            ),
             "eventwise_best_f1": sweep_event_f1(
                 diagnostics_series,
                 context.args.threshold_sweep_steps,
                 min_overlap_points=context.args.protocol_min_overlap_points,
                 min_true_overlap_fraction=context.args.protocol_min_true_overlap_fraction,
                 min_pred_overlap_fraction=context.args.protocol_min_pred_overlap_fraction,
+                **postprocess_kwargs,
             ),
         },
         "per_series": per_series,
@@ -1886,6 +1980,13 @@ def metric_summary_row(model: str, split_name: str, metrics: dict[str, Any], par
         "threshold_quantile": metrics["threshold_quantile"],
         "threshold_source": metrics["threshold_source"],
         "threshold_scope": metrics["threshold_scope"],
+        "postprocess_min_event_length": metrics["event_postprocessing"]["min_event_length"],
+        "postprocess_merge_gap": metrics["event_postprocessing"]["merge_gap"],
+        "postprocess_cooldown": metrics["event_postprocessing"]["cooldown"],
+        "postprocess_alert_mode": metrics["event_postprocessing"]["alert_mode"],
+        "postprocess_alert_window": metrics["event_postprocessing"]["alert_window"],
+        "postprocess_max_alerts_per_event": metrics["event_postprocessing"]["max_alerts_per_event"],
+        "postprocess_peak_min_distance": metrics["event_postprocessing"]["peak_min_distance"],
         "point_precision": pointwise["precision"],
         "point_recall": pointwise["recall"],
         "point_f1": pointwise["f1"],
@@ -1899,6 +2000,7 @@ def metric_summary_row(model: str, split_name: str, metrics: dict[str, Any], par
         "event_recall": eventwise["recall"],
         "event_f1": eventwise["f1"],
         "event_true_events": eventwise.get("true_events"),
+        "event_raw_pred_events": eventwise.get("raw_pred_events"),
         "event_pred_events": eventwise.get("pred_events"),
         "event_matched_events": eventwise.get("matched_events"),
         "event_fp_events": eventwise.get("fp_events"),
@@ -1935,6 +2037,7 @@ def per_series_rows(model: str, split_name: str, metrics: dict[str, Any]) -> lis
                 "n_evaluation_points": item["n_evaluation_points"],
                 "n_anomaly_points": item["n_anomaly_points"],
                 "n_true_events": item["n_true_events"],
+                "n_raw_pred_events": item.get("n_raw_pred_events"),
                 "n_pred_events": item["n_pred_events"],
                 "contaminated_train": item.get("contaminated_train"),
                 "used_fallback_train_window": item.get("used_fallback_train_window"),
@@ -1971,10 +2074,15 @@ def save_predictions(
     metrics: dict[str, Any],
 ) -> None:
     rows = []
+    postprocess_kwargs = metrics.get("event_postprocessing", {})
     for item in result.series_scores:
         frame = dataset[item.name]
         threshold = metrics["thresholds"][item.name]
-        predictions = predict(item.scores, threshold)
+        raw_predictions = np.zeros_like(item.labels, dtype=np.int8)
+        predictions = np.zeros_like(item.labels, dtype=np.int8)
+        eval_scores = item.scores[item.train_end :]
+        raw_predictions[item.train_end :] = predict(eval_scores, threshold)
+        predictions[item.train_end :] = predict(eval_scores, threshold, **postprocess_kwargs)
         timestamps = frame["timestamp"].astype(str).to_numpy()
         values = frame["value"].to_numpy(dtype=np.float32)
         for index in range(item.train_end, len(item.scores)):
@@ -1989,6 +2097,7 @@ def save_predictions(
                     "score": item.scores[index],
                     "label": item.labels[index],
                     "threshold": threshold,
+                    "raw_prediction": raw_predictions[index],
                     "prediction": predictions[index],
                     "train_end": item.train_end,
                 }
