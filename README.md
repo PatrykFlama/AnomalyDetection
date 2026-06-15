@@ -18,13 +18,35 @@ git clone https://github.com/zhihanyue/ts2vec.git ..\ts2vec
 uv run python scripts\run_experiment.py --ts2vec-dir ..\ts2vec
 ```
 
-This runs all NAB categories by default. Use `--categories` to select a subset.
+This is the original end-to-end baseline/TS2Vec workflow. It runs all NAB
+categories by default. Use `--categories` to select a subset.
 
 Fast smoke test:
 
 ```powershell
 uv run python scripts\run_experiment.py --categories realKnownCause --limit-series 2 --methods robust-zscore rolling-residual --ts2vec-iters 1 --ts2vec-batch-size 1 --ts2vec-max-train-length 64 --device cpu --ts2vec-dir ..\ts2vec
 ```
+
+## Optuna Workflow
+
+The current experiment workflow is `scripts/sweep_nab_optuna.py`. It keeps the
+evaluation protocol fixed while Optuna searches only model-specific
+hyperparameters.
+
+Run a small sweep:
+
+```console
+uv run python scripts/sweep_nab_optuna.py --model robust_zscore --n-trials 3
+```
+
+Evaluate one exact parameter set on all loaded series:
+
+```console
+uv run python scripts/sweep_nab_optuna.py --model robust_zscore --mode final --params-file outputs/optuna/nab-robust_zscore/robust_zscore/trial_0000/params.json
+```
+
+Use `--categories`, `--limit-series`, and `--dry-run` for smoke tests. TS2Vec
+runs additionally require `--ts2vec-dir`.
 
 ## Results
 
@@ -63,3 +85,14 @@ The script writes CSV statistics, a Markdown report, and PNG plots to
 
 NAB visual audit:
 https://colab.research.google.com/drive/1XaCqNpYcEjAytN1z7weSUp-F5b_zLJX1?usp=sharing
+
+## Project Structure
+
+```text
+scripts/sweep_nab_optuna.py                 model scoring and run orchestration
+src/anomaly_detection/optuna_sweep/config.py      CLI and fixed protocol configuration
+src/anomaly_detection/optuna_sweep/protocol.py    validation split and train-prefix handling
+src/anomaly_detection/optuna_sweep/evaluation.py  metrics and result export
+src/anomaly_detection/optuna_sweep/utils.py       serialization and runtime utilities
+presentation/final_presentation.pdf               final presentation
+```
